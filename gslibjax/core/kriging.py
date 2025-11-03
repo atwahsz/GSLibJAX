@@ -102,6 +102,19 @@ def ordinary_kriging(
     return estimate, variance
 
 
+def _ok_single_point(
+    x_pred_single: jnp.ndarray,
+    coords: jnp.ndarray,
+    values: jnp.ndarray,
+    kernel: CovKernel,
+    sill: float,
+    range_: float,
+    nugget: float,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Helper for batch OK: single prediction point."""
+    return ordinary_kriging(coords, values, x_pred_single, kernel, sill, range_, nugget)
+
+
 def ordinary_kriging_batch(
     coords: jnp.ndarray,
     values: jnp.ndarray,
@@ -118,8 +131,11 @@ def ordinary_kriging_batch(
     Returns:
         (estimates, variances) each shape (m,)
     """
-    ok_fn = jax.vmap(lambda xp: ordinary_kriging(coords, values, xp, kernel, sill, range_, nugget), in_axes=(None))
-    est, var = ok_fn(x_pred)
+    ok_fn = jax.vmap(
+        _ok_single_point,
+        in_axes=(0, None, None, None, None, None, None)
+    )
+    est, var = ok_fn(x_pred, coords, values, kernel, sill, range_, nugget)
     return est, var
 
 

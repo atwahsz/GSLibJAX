@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import jax
 from ..core.kriging import ordinary_kriging, ordinary_kriging_batch
 from ..core.covariance import spherical, exponential, gaussian
-from ..core.neighbor import k_nearest_indices, octant_k_indices, within_radius_indices
+from ..core.neighbor import k_nearest_indices, within_radius_indices
 from ..core.anisotropy import apply_anisotropy
 
 
@@ -81,13 +81,8 @@ def ok_predict(
             td = td[sel]
             tv = tv[sel]
         # Fall back to all if none within radius
-        def choose_indices():
-            if use_octants and td.shape[1] in (2, 3) and k_neighbors >= (4 if td.shape[1] == 2 else 8):
-                kpo = int(jnp.ceil(k_neighbors / (4 if td.shape[1] == 2 else 8)))
-                return octant_k_indices(td, xp, kpo, max_total=int(k_neighbors))
-            return k_nearest_indices(td, xp, int(k_neighbors))
-
-        idx = choose_indices()
+        # Use JIT-safe k-nearest selection (avoid boolean advanced indexing under vmap)
+        idx = k_nearest_indices(td, xp, int(k_neighbors))
         sel_c = t_data[idx]
         sel_v = data_values[idx]
         est, var = ordinary_kriging(sel_c, sel_v, xp, kernel, sill, eff_range, nugget)

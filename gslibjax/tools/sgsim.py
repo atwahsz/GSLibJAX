@@ -1,20 +1,24 @@
-"""Sequential Gaussian Simulation (SGSIM) in JAX-compatible style.
+"""JIT-safe conditional Gaussian simulation using OK moments.
 
-Provides a simplified SGS implementation:
-- Works in Gaussian space; optional normal-score fit/back-transform.
-- Uses k-nearest conditioning data (original + simulated) at each node.
+This implementation avoids dynamic boolean indexing and array growth so it
+works with JAX JIT. It performs conditional simulation by:
+1) Computing ordinary kriging mean/variance for all prediction nodes using
+   only the hard data (no path-dependent augmentation).
+2) Drawing Gaussian residuals and adding them to the kriging mean.
+
+If ``use_nscore=True``, it operates in Gaussian space by fitting a normal-score
+transform on the data and back-transforming the simulated field.
 """
 
 from __future__ import annotations
 
-from typing import Tuple, Optional
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
 
-from ..core.random import make_prng_key, split_key, normal
-from ..core.neighbor import k_nearest_indices, octant_k_indices, within_radius_indices
-from ..core.kriging import ordinary_kriging
+from ..core.random import make_prng_key
+from ..core.kriging import ordinary_kriging_batch
 from ..core.covariance import spherical, exponential, gaussian
 from .nscore import NScoreModel, fit_nscore, nscore_transform, nscore_inverse
 
@@ -43,70 +47,30 @@ def sgsim_gaussian(
     search_radius: float | None = None,
     use_octants: bool = True,
 ) -> jnp.ndarray:
-    """Sequential Gaussian simulation given normal-score data.
+    """Gaussian-space conditional simulation via OK moments (JIT-safe).
 
-    Args:
-        data_coords: (n, d)
-        data_vals_ns: (n,) normal-score values
-        grid_coords: (m, d) nodes to simulate
-        kernel_name: covariance model name
-        sill, range_, nugget: covariance parameters
-        k_neighbors: max neighbors from conditioning set
-        seed: RNG seed
-
-    Returns:
-        Simulated normal-score values (m,)
+    Computes OK mean/variance for all prediction locations using the hard data,
+    then samples one realization by adding Gaussian residuals. Path dependence
+    is intentionally not modeled to keep the computation JIT-safe and vectorized.
     """
+    del k_neighbors, search_radius, use_octants  # not used in JIT-safe variant
     kernel = _get_kernel(kernel_name)
-    m = grid_coords.shape[0]
-    key = make_prng_key(seed)
-    # Random visiting order
-    key, sub = jax.random.split(key)
-    path = jax.random.permutation(sub, m)
 
-    # Conditioning set starts with data
-    cond_coords = data_coords
-    cond_vals = data_vals_ns
+    # Batch OK moments from hard data only
+    mu, var = ordinary_kriging_batch(
+        coords=jnp.asarray(data_coords),
+        values=jnp.asarray(data_vals_ns),
+        x_pred=jnp.asarray(grid_coords),
+        kernel=kernel,
+        sill=sill,
+        range_=range_,
+        nugget=nugget,
+    )
 
-    sim_vals = jnp.zeros((m,), dtype=jnp.float32)
-
-    def body_fun(carry, idx):
-        key, cond_coords, cond_vals, sim_vals = carry
-        node_id = path[idx]
-        x = grid_coords[node_id]
-        # select neighbors
-        all_coords = cond_coords
-        all_vals = cond_vals
-        # Optional radius filtering
-        if search_radius is not None and search_radius > 0:
-            idxr = within_radius_indices(all_coords, x, float(search_radius))
-            valid = idxr >= 0
-            selr = idxr[valid]
-            all_coords = all_coords[selr]
-            all_vals = all_vals[selr]
-        kk = jnp.minimum(k_neighbors, all_coords.shape[0])
-        # Octant-balanced selection when possible
-        def choose_idx():
-            if use_octants and all_coords.shape[1] in (2, 3) and k_neighbors >= (4 if all_coords.shape[1] == 2 else 8):
-                kpo = int(jnp.ceil(k_neighbors / (4 if all_coords.shape[1] == 2 else 8)))
-                return octant_k_indices(all_coords, x, kpo, max_total=int(k_neighbors))
-            return k_nearest_indices(all_coords, x, kk)
-        nidx = choose_idx()
-        sel_c = all_coords[nidx]
-        sel_v = all_vals[nidx]
-        mean, var = ordinary_kriging(sel_c, sel_v, x, kernel, sill, range_, nugget)
-        var = jnp.maximum(var, 1e-8)
-        key, ns_key = jax.random.split(key)
-        z = jax.random.normal(ns_key, ())
-        sim_val = mean + jnp.sqrt(var) * z
-        sim_vals = sim_vals.at[node_id].set(sim_val)
-        # augment conditioning set
-        cond_coords = jnp.concatenate([cond_coords, x[None, :]], axis=0)
-        cond_vals = jnp.concatenate([cond_vals, jnp.array([sim_val])], axis=0)
-        return (key, cond_coords, cond_vals, sim_vals), None
-
-    (key, _, _, sim_vals), _ = jax.lax.scan(body_fun, (key, cond_coords, cond_vals, sim_vals), jnp.arange(m))
-    return sim_vals
+    key = make_prng_key(int(seed))
+    z = jax.random.normal(key, shape=mu.shape)
+    sim = mu + jnp.sqrt(jnp.maximum(var, 1e-12)) * z
+    return sim
 
 
 def sgsim(
