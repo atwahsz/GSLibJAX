@@ -1,0 +1,9 @@
+jax>=0.4.30
+jaxlib>=0.4.30
+numpy>=1.26
+scipy>=1.11
+pandas>=2.1
+rich>=13.7
+typer>=0.12
+matplotlib>=3.8
+
